@@ -4,6 +4,7 @@ import imageio
 import json
 import random
 import time
+from typing import Any, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -67,6 +68,37 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
 
     all_ret = {k : torch.cat(all_ret[k], 0) for k in all_ret}
     return all_ret
+
+
+def compute_occ_aabb(poses: np.ndarray,
+                     meta: Dict[str, Any],
+                     near: float,
+                     far: float,
+                     padding_scale: float = 1.5) -> torch.Tensor:
+    """Derive an occupancy-grid AABB from dataset poses and metadata."""
+    if poses.size == 0:
+        center = np.zeros(3, dtype=np.float32)
+        extent = np.ones(3, dtype=np.float32) * 0.5
+    else:
+        centers = poses[:, :3, 3]
+        bbox_min = centers.min(axis=0)
+        bbox_max = centers.max(axis=0)
+        align_bbox = meta.get('alignment', {}).get('bbox_after') if meta else None
+        if isinstance(align_bbox, dict):
+            if 'min' in align_bbox:
+                bbox_min = np.minimum(bbox_min, np.asarray(align_bbox['min'], dtype=np.float32))
+            if 'max' in align_bbox:
+                bbox_max = np.maximum(bbox_max, np.asarray(align_bbox['max'], dtype=np.float32))
+        center = 0.5 * (bbox_min + bbox_max)
+        extent = 0.5 * (bbox_max - bbox_min)
+    extent = np.maximum(extent, np.ones(3, dtype=np.float32) * 0.5)
+    radius = float(np.linalg.norm(extent))
+    padding = max(far, radius * padding_scale, 1.0)
+    half = extent + padding
+    aabb_min = center - half
+    aabb_max = center + half
+    occ = np.concatenate([aabb_min, aabb_max]).astype(np.float32)
+    return torch.tensor(occ, device=device)
 
 
 def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
@@ -178,7 +210,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     return rgbs, disps
 
 
-def create_nerf(args):
+def create_nerf(args, occ_aabb: torch.Tensor):
     """Instantiate NeRF's MLP model.
     """
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
@@ -238,12 +270,13 @@ def create_nerf(args):
     ##########################
 
     occ_estimator = nerfacc.OccGridEstimator(
-        roi_aabb=torch.tensor(
-            [-2.5, -2.5, -2.5, 2.5, 2.5, 2.5], device=device
-        ),
+        roi_aabb=occ_aabb,
         resolution=128,
         levels=1,
     ).to(device)
+    with torch.no_grad():
+        occ_estimator.occs.fill_(1.0)
+        occ_estimator.binaries.fill_(True)
 
     render_kwargs_train = {
         'network_query_fn' : network_query_fn,
@@ -402,21 +435,10 @@ def render_rays(ray_batch,
         )
 
     if ray_indices.numel() == 0:
-        zeros_rgb = torch.zeros((N_rays, 3), device=device)
-        zeros_scalar = torch.zeros((N_rays,), device=device)
-        ret = {
-            'rgb_map': zeros_rgb,
-            'disp_map': zeros_scalar,
-            'acc_map': zeros_scalar,
-        }
-        if retraw:
-            ret['raw'] = torch.zeros((N_rays, 1), device=device)
-        if N_importance > 0 and network_fine is not None:
-            ret['rgb0'] = zeros_rgb
-            ret['disp0'] = zeros_scalar
-            ret['acc0'] = zeros_scalar
-            ret['z_std'] = zeros_scalar
-        return ret
+        raise RuntimeError(
+            'nerfacc occupancy sampling returned no samples. '
+            'Consider enlarging the occupancy bounds or adjusting step size.'
+        )
 
     def _add_noise(raw_sigma: Tensor) -> Tensor:
         if raw_noise_std <= 0.0:
@@ -473,7 +495,7 @@ def render_rays(ray_batch,
 
     depth_map = depth_final.squeeze(-1)
     acc_map = opacity_final.squeeze(-1)
-    disp_map = acc_map / torch.clamp(depth_map, min=1e-10)
+    disp_map = 1. / torch.clamp(depth_map, min=1e-10)
 
     ret = {
         'rgb_map': colors_final,
@@ -487,7 +509,7 @@ def render_rays(ray_batch,
     if N_importance > 0 and network_fine is not None:
         depth_coarse_map = depth_coarse.squeeze(-1)
         acc_coarse_map = opacity_coarse.squeeze(-1)
-        disp_coarse = acc_coarse_map / torch.clamp(depth_coarse_map, min=1e-10)
+        disp_coarse = 1. / torch.clamp(depth_coarse_map, min=1e-10)
         ret['rgb0'] = colors_coarse
         ret['disp0'] = disp_coarse
         ret['acc0'] = acc_coarse_map
@@ -653,7 +675,7 @@ def train():
 
     # Load data via unified dataset loader
     K = None
-    images, poses, hwf, dataset_near, dataset_far, _ = load_dataset(
+    images, poses, hwf, dataset_near, dataset_far, dataset_meta = load_dataset(
         args.datadir,
         downsample=args.factor if args.factor and args.factor > 1 else None,
     )
@@ -717,8 +739,10 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
+    occ_aabb = compute_occ_aabb(poses, dataset_meta, near, far)
+
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args, occ_aabb)
     global_step = start
 
     bds_dict = {
