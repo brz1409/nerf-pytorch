@@ -3,12 +3,84 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import nerfacc
 
 
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
+
+def build_nerfacc_intervals(ray_indices, t_starts, t_ends, weights, n_rays):
+    """Prepare nerfacc interval data structures from flattened samples.
+
+    Args:
+        ray_indices (torch.LongTensor): Shape (n_samples,). Ray index for each sample.
+        t_starts (torch.Tensor): Shape (n_samples,). Ray-march entry distances.
+        t_ends (torch.Tensor): Shape (n_samples,). Ray-march exit distances.
+        weights (torch.Tensor): Shape (n_samples,). Rendering weights per sample.
+        n_rays (int): Number of rays represented by the flattened buffers.
+
+    Returns:
+        Tuple[nerfacc.RayIntervals, torch.Tensor, torch.LongTensor]:
+        intervals usable by nerfacc.importance_sampling, CDF values at each
+        interval edge (matching ``intervals.vals``), and the per-ray
+        ``packed_info`` (start index, count). Returns (None, None, None) if no
+        samples are available.
+    """
+    if ray_indices.numel() == 0:
+        return None, None, None
+
+    packed_info = nerfacc.pack_info(ray_indices, n_rays=n_rays)
+    sample_counts = packed_info[:, 1]
+    if int(sample_counts.sum().item()) == 0:
+        return None, None, packed_info
+
+    edge_counts = sample_counts * 2
+    edge_starts = torch.cumsum(edge_counts, dim=0) - edge_counts
+    edge_packed_info = torch.stack([edge_starts, edge_counts], dim=-1)
+    total_edges = int(edge_counts.sum().item())
+
+    vals = torch.empty(total_edges, dtype=t_starts.dtype, device=t_starts.device)
+    vals[0::2] = t_starts
+    vals[1::2] = t_ends
+
+    edge_ray_indices = ray_indices.repeat_interleave(2)
+    is_left = torch.zeros(total_edges, dtype=torch.bool, device=ray_indices.device)
+    is_left[0::2] = True
+    is_right = ~is_left
+
+    cdf_edges = torch.empty(total_edges, dtype=weights.dtype, device=weights.device)
+    cdf_left = torch.empty_like(weights)
+    cdf_right = torch.empty_like(weights)
+
+    packed_info_cpu = packed_info.detach().cpu()
+    zeros_buffer = torch.zeros(1, dtype=weights.dtype, device=weights.device)
+    for ray_id in range(n_rays):
+        start = int(packed_info_cpu[ray_id, 0].item())
+        count = int(packed_info_cpu[ray_id, 1].item())
+        if count == 0:
+            continue
+        ray_weights = weights[start:start + count]
+        cumulative = torch.cumsum(ray_weights, dim=0)
+        cdf_right[start:start + count] = cumulative
+        if count == 1:
+            cdf_left[start:start + count] = zeros_buffer
+        else:
+            cdf_left[start:start + count] = torch.cat([zeros_buffer, cumulative[:-1]], dim=0)
+
+    cdf_edges[0::2] = cdf_left
+    cdf_edges[1::2] = cdf_right
+    cdf_edges.clamp_(0.0, 1.0)
+
+    intervals = nerfacc.RayIntervals(
+        vals=vals,
+        packed_info=edge_packed_info,
+        ray_indices=edge_ray_indices,
+        is_left=is_left,
+        is_right=is_right,
+    )
+    return intervals, cdf_edges, packed_info
 
 
 # Positional encoding (section 5.1)
