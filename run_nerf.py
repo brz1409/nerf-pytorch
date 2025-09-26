@@ -96,7 +96,11 @@ def render_rays_chunk(
             return empty_rgb, empty_sigma
         mid = 0.5 * (t_starts + t_ends)
         pts = rays_o[ray_indices] + rays_d_unit[ray_indices] * mid[:, None]
-        dirs = viewdirs[ray_indices] if viewdirs is not None else None
+        dirs = None
+        if viewdirs is not None:
+            dirs = viewdirs[ray_indices]
+            if dirs.ndim > 2:
+                dirs = dirs.view(dirs.shape[0], -1)
         raw = network_query_fn(pts, dirs, current_network)
         sigma_raw = raw[..., 3]
         if add_noise and raw_noise_std > 0.0 and not pytest:
@@ -842,14 +846,13 @@ def train():
         if estimator is not None:
             with torch.no_grad():
                 def occ_eval_fn(x):
-                    pts = x.unsqueeze(1)
                     dirs = torch.zeros_like(x, device=x.device) if render_kwargs_train['use_viewdirs'] else None
                     raw = render_kwargs_train['network_query_fn'](
-                        pts,
+                        x,
                         dirs,
                         render_kwargs_train['network_fn'],
                     )
-                    sigma = F.relu(raw[..., 3])  # (N, 1)
+                    sigma = F.relu(raw[..., 3])
                     return sigma * render_kwargs_train['render_step_size']
 
                 estimator.update_every_n_steps(
