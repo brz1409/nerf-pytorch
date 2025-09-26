@@ -62,11 +62,20 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     for i in range(0, rays_flat.shape[0], chunk):
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret:
-            if k not in all_ret:
-                all_ret[k] = []
-            all_ret[k].append(ret[k])
+            if k == 'num_samples':
+                value = int(ret[k].sum().item()) if isinstance(ret[k], torch.Tensor) else int(ret[k])
+                all_ret[k] = all_ret.get(k, 0) + value
+            else:
+                if k not in all_ret:
+                    all_ret[k] = []
+                all_ret[k].append(ret[k])
 
-    all_ret = {k : torch.cat(all_ret[k], 0) for k in all_ret}
+    for k in list(all_ret.keys()):
+        if k == 'num_samples':
+            device = rays_flat.device
+            all_ret[k] = torch.tensor(all_ret[k], device=device, dtype=torch.int32)
+        else:
+            all_ret[k] = torch.cat(all_ret[k], 0)
     return all_ret
 
 
@@ -74,8 +83,19 @@ def compute_occ_aabb(poses: np.ndarray,
                      meta: Dict[str, Any],
                      near: float,
                      far: float,
+                     use_ndc: bool,
                      padding_scale: float = 1.5) -> torch.Tensor:
     """Derive an occupancy-grid AABB from dataset poses and metadata."""
+    if use_ndc:
+        far_ndc = max(far, 1.0)
+        aabb = torch.tensor(
+            [-1.5, -1.5, 0.0,
+             1.5, 1.5, far_ndc],
+            dtype=torch.float32,
+            device=device,
+        )
+        return aabb
+
     if poses.size == 0:
         center = np.zeros(3, dtype=np.float32)
         extent = np.ones(3, dtype=np.float32) * 0.5
@@ -160,6 +180,8 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
+        if k == 'num_samples':
+            continue
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
 
@@ -289,9 +311,9 @@ def create_nerf(args, occ_aabb: torch.Tensor):
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
         'occ_estimator': occ_estimator,
-        'occ_render_step_size': None,
-        'occ_alpha_thre': 1e-2,
-        'occ_early_stop_eps': 1e-4,
+        'render_step_size': None,
+        'alpha_thre': 1e-2,
+        'early_stop_eps': 1e-4,
         'occ_update_every': 16,
         'occ_thre': 1e-2,
         'occ_ema_decay': 0.95,
@@ -313,54 +335,6 @@ def create_nerf(args, occ_aabb: torch.Tensor):
     render_kwargs_test['update_occ_grid'] = False
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
-
-
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
-    """Transforms model's predictions to semantically meaningful values.
-    Args:
-        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
-        z_vals: [num_rays, num_samples along ray]. Integration time.
-        rays_d: [num_rays, 3]. Direction of each ray.
-    Returns:
-        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-        disp_map: [num_rays]. Disparity map. Inverse of depth map.
-        acc_map: [num_rays]. Sum of weights along each ray.
-        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-        depth_map: [num_rays]. Estimated distance to object.
-    """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
-
-    dists = z_vals[...,1:] - z_vals[...,:-1]
-    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
-
-    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
-
-    rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
-    noise = 0.
-    if raw_noise_std > 0.:
-        noise = torch.randn(raw[...,3].shape) * raw_noise_std
-
-        # Overwrite randomly sampled data if pytest
-        if pytest:
-            np.random.seed(0)
-            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
-            noise = torch.Tensor(noise)
-
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
-    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
-    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
-
-    depth_map = torch.sum(weights * z_vals, -1)
-    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
-    acc_map = torch.sum(weights, -1)
-
-    if white_bkgd:
-        rgb_map = rgb_map + (1.-acc_map[...,None])
-
-    return rgb_map, disp_map, acc_map, weights, depth_map
-
-
 def render_rays(ray_batch,
                 network_fn,
                 network_query_fn,
@@ -395,50 +369,11 @@ def render_rays(ray_batch,
     near_plane = float(torch.min(t_min).detach().item())
     far_plane = float(torch.max(t_max).detach().item())
 
-    occ_render_step_size = kwargs.get('occ_render_step_size')
-    if occ_render_step_size is None:
-        span = torch.mean(torch.clamp(t_max - t_min, min=1e-3)).detach().item()
-        occ_render_step_size = max(span / max(N_samples, 1), 1e-3)
-
-    occ_alpha_thre = kwargs.get('occ_alpha_thre', 1e-2)
-    occ_early_stop_eps = kwargs.get('occ_early_stop_eps', 1e-4)
-    cone_angle = 0.0
-
     use_viewdirs = kwargs.get('use_viewdirs', False)
     white_bkgd = kwargs.get('white_bkgd', False)
     raw_noise_std = kwargs.get('raw_noise_std', 0.0)
 
     perturb_enabled = perturb > 0.
-
-    def _sigma_fn(t_starts: Tensor, t_ends: Tensor, ray_indices: Tensor) -> Tensor:
-        mid = (t_starts + t_ends) * 0.5
-        positions = rays_o[ray_indices] + rays_d_norm[ray_indices] * mid[:, None]
-        dirs = viewdirs[ray_indices] if viewdirs is not None else None
-        raw = network_query_fn(positions, dirs, network_fn)
-        sigmas = F.relu(raw[..., 3])
-        return sigmas
-
-    with torch.no_grad():
-        ray_indices, t_starts, t_ends = occ_estimator.sampling(
-            rays_o,
-            rays_d_norm,
-            sigma_fn=_sigma_fn,
-            near_plane=near_plane,
-            far_plane=far_plane,
-            t_min=t_min,
-            t_max=t_max,
-            render_step_size=occ_render_step_size,
-            early_stop_eps=occ_early_stop_eps,
-            alpha_thre=occ_alpha_thre,
-            stratified=perturb_enabled,
-            cone_angle=cone_angle,
-        )
-
-    if ray_indices.numel() == 0:
-        raise RuntimeError(
-            'nerfacc occupancy sampling returned no samples. '
-            'Consider enlarging the occupancy bounds or adjusting step size.'
-        )
 
     def _add_noise(raw_sigma: Tensor) -> Tensor:
         if raw_noise_std <= 0.0:
@@ -451,20 +386,58 @@ def render_rays(ray_batch,
             noise = torch.randn_like(raw_sigma) * raw_noise_std
         return raw_sigma + noise
 
+    render_step_size = kwargs.get('render_step_size')
+    if render_step_size is None:
+        avg_span = torch.mean(torch.clamp(t_max - t_min, min=1e-3)).detach().item()
+        render_step_size = max(avg_span / max(float(N_samples), 1.0), 1e-3)
+
+    alpha_thre = kwargs.get('alpha_thre', 1e-2)
+    early_stop_eps = kwargs.get('early_stop_eps', 1e-4)
+    cone_angle = kwargs.get('cone_angle', 0.0)
+
+    def _sigma_fn_est(t_s: Tensor, t_e: Tensor, r_idx: Tensor) -> Tensor:
+        if t_s.shape[0] == 0:
+            return torch.empty((0,), device=device, dtype=rays_o.dtype)
+        mid = (t_s + t_e) * 0.5
+        positions = rays_o[r_idx] + rays_d_norm[r_idx] * mid[:, None]
+        dirs = viewdirs[r_idx] if viewdirs is not None else None
+        raw = network_query_fn(positions, dirs, network_fn)
+        sigmas = F.relu(raw[..., 3])
+        return sigmas
+
+    with torch.no_grad():
+        ray_indices, t_starts, t_ends = occ_estimator.sampling(
+            rays_o,
+            rays_d_norm,
+            sigma_fn=_sigma_fn_est,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            t_min=t_min,
+            t_max=t_max,
+            render_step_size=render_step_size,
+            early_stop_eps=early_stop_eps,
+            alpha_thre=alpha_thre,
+            stratified=perturb_enabled,
+            cone_angle=cone_angle,
+        )
+
+    num_samples = t_starts.shape[0]
+    render_bkgd = torch.ones(3, device=device) if white_bkgd else None
+
     def _render_with_network(current_network: nn.Module):
-        raw_records = []
-
         def rgb_sigma_fn(t_s: Tensor, t_e: Tensor, r_idx: Tensor):
-            mid = (t_s + t_e) * 0.5
-            positions = rays_o[r_idx] + rays_d_norm[r_idx] * mid[:, None]
-            dirs = viewdirs[r_idx] if viewdirs is not None else None
-            raw = network_query_fn(positions, dirs, current_network)
-            raw_records.append(raw)
-            rgb = torch.sigmoid(raw[..., :3])
-            sigma = F.relu(_add_noise(raw[..., 3]))
-            return rgb, sigma
+            if t_s.shape[0] == 0:
+                rgbs = torch.empty((0, 3), device=device)
+                sigmas = torch.empty((0,), device=device)
+            else:
+                mid = (t_s + t_e) * 0.5
+                positions = rays_o[r_idx] + rays_d_norm[r_idx] * mid[:, None]
+                dirs = viewdirs[r_idx] if viewdirs is not None else None
+                raw = network_query_fn(positions, dirs, current_network)
+                rgbs = torch.sigmoid(raw[..., :3])
+                sigmas = F.relu(_add_noise(raw[..., 3]))
+            return rgbs, sigmas
 
-        render_bkgd = torch.ones(3, device=device) if white_bkgd else None
         colors, opacities, depths, extras = nerfacc.rendering(
             t_starts,
             t_ends,
@@ -473,25 +446,21 @@ def render_rays(ray_batch,
             rgb_sigma_fn=rgb_sigma_fn,
             render_bkgd=render_bkgd,
         )
+        return colors, opacities, depths, extras
 
-        raw_all = torch.cat(raw_records, dim=0) if raw_records else torch.empty((0, 4), device=device)
-        return colors, opacities, depths, extras, raw_all
-
-    colors_coarse, opacity_coarse, depth_coarse, extras_coarse, raw_coarse = _render_with_network(network_fn)
+    colors_coarse, opacity_coarse, depth_coarse, extras_coarse = _render_with_network(network_fn)
 
     colors_final = colors_coarse
     opacity_final = opacity_coarse
     depth_final = depth_coarse
     extras_final = extras_coarse
-    raw_final = raw_coarse
 
     if N_importance > 0 and network_fine is not None:
-        colors_fine, opacity_fine, depth_fine, extras_fine, raw_fine = _render_with_network(network_fine)
+        colors_fine, opacity_fine, depth_fine, extras_fine = _render_with_network(network_fine)
         colors_final = colors_fine
         opacity_final = opacity_fine
         depth_final = depth_fine
         extras_final = extras_fine
-        raw_final = raw_fine
 
     depth_map = depth_final.squeeze(-1)
     acc_map = opacity_final.squeeze(-1)
@@ -501,10 +470,8 @@ def render_rays(ray_batch,
         'rgb_map': colors_final,
         'disp_map': disp_map,
         'acc_map': acc_map,
+        'num_samples': torch.tensor(num_samples, device=device, dtype=torch.int32),
     }
-
-    if retraw:
-        ret['raw'] = opacity_final
 
     if N_importance > 0 and network_fine is not None:
         depth_coarse_map = depth_coarse.squeeze(-1)
@@ -514,19 +481,19 @@ def render_rays(ray_batch,
         ret['disp0'] = disp_coarse
         ret['acc0'] = acc_coarse_map
 
-        weights_final = extras_final.get('weights')
-        if weights_final is not None:
-            z_mids = (t_starts + t_ends) * 0.5
-            w_sum = torch.zeros(N_rays, device=device).scatter_add_(0, ray_indices, weights_final)
-            weighted_mean = torch.zeros(N_rays, device=device).scatter_add_(0, ray_indices, weights_final * z_mids)
-            mean = weighted_mean / torch.clamp(w_sum, min=1e-10)
-            var = torch.zeros(N_rays, device=device).scatter_add_(
-                0, ray_indices, weights_final * (z_mids - mean[ray_indices]) ** 2
-            )
-            std = torch.sqrt(var / torch.clamp(w_sum, min=1e-10))
-        else:
-            std = torch.zeros_like(acc_map)
-        ret['z_std'] = std
+    weights_final = extras_final.get('weights')
+    if weights_final is not None and weights_final.numel() > 0:
+        z_mids = (t_starts + t_ends) * 0.5
+        w_sum = torch.zeros(N_rays, device=device).scatter_add_(0, ray_indices, weights_final)
+        weighted_mean = torch.zeros(N_rays, device=device).scatter_add_(0, ray_indices, weights_final * z_mids)
+        mean = weighted_mean / torch.clamp(w_sum, min=1e-10)
+        var = torch.zeros(N_rays, device=device).scatter_add_(
+            0, ray_indices, weights_final * (z_mids - mean[ray_indices]) ** 2
+        )
+        std = torch.sqrt(var / torch.clamp(w_sum, min=1e-10))
+    else:
+        std = torch.zeros(N_rays, device=device)
+    ret['z_std'] = std
 
     update_occ_grid = kwargs.get('update_occ_grid', False)
     if update_occ_grid:
@@ -539,7 +506,8 @@ def render_rays(ray_batch,
         def occ_eval_fn(x: Tensor) -> Tensor:
             dirs = torch.zeros_like(x) if use_viewdirs else None
             raw = network_query_fn(x, dirs, network_fn)
-            return F.relu(raw[..., 3:4])
+            sigma = F.relu(raw[..., 3:4])
+            return sigma * render_step_size
 
         occ_estimator.update_every_n_steps(
             step=global_step,
@@ -550,9 +518,9 @@ def render_rays(ray_batch,
             n=occ_update_every,
         )
 
-    for k in ret:
-        if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
-            print(f"! [Numerical Error] {k} contains nan or inf.")
+    for key in ('rgb_map', 'disp_map', 'acc_map'):
+        if (torch.isnan(ret[key]).any() or torch.isinf(ret[key]).any()) and DEBUG:
+            print(f"! [Numerical Error] {key} contains nan or inf.")
 
     return ret
 
@@ -739,7 +707,8 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
-    occ_aabb = compute_occ_aabb(poses, dataset_meta, near, far)
+    use_ndc = not args.no_ndc
+    occ_aabb = compute_occ_aabb(poses, dataset_meta, near, far, use_ndc)
 
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args, occ_aabb)
@@ -867,9 +836,12 @@ def train():
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
 
+        num_samples_tensor = extras.get('num_samples')
+        if num_samples_tensor is not None and num_samples_tensor.sum() == 0:
+            continue
+
         optimizer.zero_grad()
         img_loss = img2mse(rgb, target_s)
-        trans = extras['raw'][...,-1]
         loss = img_loss
         psnr = mse2psnr(img_loss)
 
