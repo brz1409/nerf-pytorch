@@ -13,10 +13,7 @@ import matplotlib.pyplot as plt
 
 from run_nerf_helpers import *
 
-from load_llff import load_llff_data
-from load_deepvoxels import load_dv_data
-from load_blender import load_blender_data
-from load_LINEMOD import load_LINEMOD_data
+from load_dataset import load_dataset
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -536,76 +533,42 @@ def train():
     parser = config_parser()
     args = parser.parse_args()
 
-    # Load data
+    # Load data via unified dataset loader
     K = None
-    if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
-                                                                  recenter=True, bd_factor=.75,
-                                                                  spherify=args.spherify)
-        hwf = poses[0,:3,-1]
-        poses = poses[:,:3,:4]
-        print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
-        if not isinstance(i_test, list):
-            i_test = [i_test]
+    images, poses, hwf, dataset_near, dataset_far, _ = load_dataset(
+        args.datadir,
+        downsample=args.factor if args.factor and args.factor > 1 else None,
+    )
+    poses = poses.astype(np.float32)
+    images = images.astype(np.float32) / 255.0
+    bottom = np.broadcast_to(np.array([0., 0., 0., 1.], dtype=np.float32), (poses.shape[0], 1, 4))
+    render_poses = np.concatenate([poses, bottom], axis=1)
+    print('Loaded dataset', images.shape, render_poses.shape, hwf, args.datadir)
 
-        if args.llffhold > 0:
-            print('Auto LLFF holdout,', args.llffhold)
-            i_test = np.arange(images.shape[0])[::args.llffhold]
+    num_images = images.shape[0]
+    if num_images == 0:
+        raise ValueError(f'No images found in dataset {args.datadir}')
 
-        i_val = i_test
-        i_train = np.array([i for i in np.arange(int(images.shape[0])) if
-                        (i not in i_test and i not in i_val)])
-
-        print('DEFINING BOUNDS')
-        if args.no_ndc:
-            near = np.ndarray.min(bds) * .9
-            far = np.ndarray.max(bds) * 1.
-            
-        else:
-            near = 0.
-            far = 1.
-        print('NEAR FAR', near, far)
-
-    elif args.dataset_type == 'blender':
-        images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
-        print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
-        i_train, i_val, i_test = i_split
-
-        near = 2.
-        far = 6.
-
-        if args.white_bkgd:
-            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
-        else:
-            images = images[...,:3]
-
-    elif args.dataset_type == 'LINEMOD':
-        images, poses, render_poses, hwf, K, i_split, near, far = load_LINEMOD_data(args.datadir, args.half_res, args.testskip)
-        print(f'Loaded LINEMOD, images shape: {images.shape}, hwf: {hwf}, K: {K}')
-        print(f'[CHECK HERE] near: {near}, far: {far}.')
-        i_train, i_val, i_test = i_split
-
-        if args.white_bkgd:
-            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
-        else:
-            images = images[...,:3]
-
-    elif args.dataset_type == 'deepvoxels':
-
-        images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
-                                                                 basedir=args.datadir,
-                                                                 testskip=args.testskip)
-
-        print('Loaded deepvoxels', images.shape, render_poses.shape, hwf, args.datadir)
-        i_train, i_val, i_test = i_split
-
-        hemi_R = np.mean(np.linalg.norm(poses[:,:3,-1], axis=-1))
-        near = hemi_R-1.
-        far = hemi_R+1.
-
+    if args.llffhold > 0 and num_images > 1:
+        print('Auto holdout,', args.llffhold)
+        i_test = np.arange(num_images)[::args.llffhold]
+        if i_test.size == 0:
+            i_test = np.array([num_images - 1])
     else:
-        print('Unknown dataset type', args.dataset_type, 'exiting')
-        return
+        i_test = np.array([num_images - 1])
+
+    i_val = i_test
+    i_train = np.array([i for i in np.arange(num_images) if (i not in i_test and i not in i_val)])
+    if i_train.size == 0:
+        i_train = np.arange(num_images)
+
+    if args.no_ndc:
+        near = dataset_near
+        far = dataset_far
+    else:
+        near = 0.
+        far = 1.
+    print('NEAR FAR', near, far)
 
     # Cast intrinsics to right types
     H, W, focal = hwf
