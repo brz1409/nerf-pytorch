@@ -842,13 +842,14 @@ def train():
         if estimator is not None:
             with torch.no_grad():
                 def occ_eval_fn(x):
-                    dirs = torch.zeros_like(x) if render_kwargs_train['use_viewdirs'] else None
+                    pts = x.unsqueeze(1)
+                    dirs = torch.zeros_like(x, device=x.device) if render_kwargs_train['use_viewdirs'] else None
                     raw = render_kwargs_train['network_query_fn'](
-                        x,
+                        pts,
                         dirs,
                         render_kwargs_train['network_fn'],
                     )
-                    sigma = F.relu(raw[..., 3:4])
+                    sigma = F.relu(raw[..., 3])  # (N, 1)
                     return sigma * render_kwargs_train['render_step_size']
 
                 estimator.update_every_n_steps(
