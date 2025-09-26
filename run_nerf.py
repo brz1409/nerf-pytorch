@@ -39,8 +39,19 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     embedded = embed_fn(inputs_flat)
 
     if viewdirs is not None:
-        input_dirs = viewdirs[:,None].expand(inputs.shape)
-        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+        # Robust an Inputs-Shape anpassen (unterstützt [N,3] und [N_rays,N_samples,3])
+        vd = viewdirs
+        # Falls bereits 2D und gleiche Anzahl Samples wie inputs_flat: direkt verwenden
+        if vd.dim() == 2 and vd.shape[0] == inputs_flat.shape[0]:
+            input_dirs_flat = vd.reshape(-1, vd.shape[-1])
+        else:
+            # Dims angleichen und auf inputs broadcasten
+            while vd.dim() < inputs.dim():
+                vd = vd.unsqueeze(-2)
+            # Zielshape = inputs.shape[:-1] + [3]
+            target_shape = list(inputs.shape[:-1]) + [vd.shape[-1]]
+            vd = vd.expand(*target_shape)
+            input_dirs_flat = vd.reshape(-1, vd.shape[-1])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
         embedded = torch.cat([embedded, embedded_dirs], -1)
 
@@ -987,6 +998,6 @@ def train():
 
 
 if __name__=='__main__':
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
-
+    if torch.cuda.is_available():
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
     train()
