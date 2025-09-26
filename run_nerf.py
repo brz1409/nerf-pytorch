@@ -369,7 +369,8 @@ def render_rays(ray_batch,
     near_plane = float(torch.min(t_min).detach().item())
     far_plane = float(torch.max(t_max).detach().item())
 
-    use_viewdirs = kwargs.get('use_viewdirs', False)
+    requires_viewdirs = getattr(network_fn, 'input_ch_views', 0) > 0
+    use_viewdirs = kwargs.get('use_viewdirs', requires_viewdirs)
     white_bkgd = kwargs.get('white_bkgd', False)
     raw_noise_std = kwargs.get('raw_noise_std', 0.0)
 
@@ -504,7 +505,7 @@ def render_rays(ray_batch,
         global_step = kwargs.get('global_step', 0)
 
         def occ_eval_fn(x: Tensor) -> Tensor:
-            dirs = torch.zeros_like(x) if use_viewdirs else None
+            dirs = torch.zeros_like(x) if requires_viewdirs else None
             raw = network_query_fn(x, dirs, network_fn)
             sigma = F.relu(raw[..., 3:4])
             return sigma * render_step_size
