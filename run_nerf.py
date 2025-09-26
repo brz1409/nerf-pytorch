@@ -337,7 +337,8 @@ def render_rays(ray_batch,
                 white_bkgd=False,
                 raw_noise_std=0.,
                 verbose=False,
-                pytest=False):
+                pytest=False,
+                **kwargs):
     """Volumetric rendering using nerfacc accelerated sampling."""
 
     N_rays = ray_batch.shape[0]
