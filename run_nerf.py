@@ -806,6 +806,9 @@ def config_parser():
 
     # PropNetEstimator-Flags ergänzen
     parser.add_argument("--use_propnet_estimator", action='store_true', help='use nerfacc PropNetEstimator (proposal nets)')
+    # Standardmäßig aktivieren und Abschalt-Flag anbieten
+    parser.set_defaults(use_propnet_estimator=True)
+    parser.add_argument("--no-propnet", dest='use_propnet_estimator', action='store_false', help='disable nerfacc PropNetEstimator')
     parser.add_argument("--propnet_levels", type=int, default=2, help='number of proposal levels')
     parser.add_argument("--propnet_samples", type=str, default="64,64", help='samples per level, comma-separated or single int')
     parser.add_argument("--prop_multires", type=int, default=6, help='positional encoding multires for proposal nets')
