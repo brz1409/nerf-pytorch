@@ -102,7 +102,7 @@ replace `{DATASET}` with `trex` | `horns` | `flower` | `fortress` | `lego` | etc
 
 
 #### NerfAcc configuration
-When `N_importance=0` the training loop uses a single NeRF that is fully accelerated by nerfacc. Setting `N_importance>0` re-enables the classic coarse/fine two-stage setup: the coarse model still relies on nerfacc sampling while an additional fine network renders a second pass for higher fidelity outputs.
+This branch always trains a single nerfacc-accelerated NeRF. The legacy coarse/fine split and `N_importance` flag were removed; tune per-ray sampling density via `N_samples` only.
 
 
 ### Pre-trained Models

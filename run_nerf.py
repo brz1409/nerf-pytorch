@@ -261,19 +261,12 @@ def create_nerf(args, occ_aabb: torch.Tensor):
     embeddirs_fn = None
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
-    output_ch = 5 if args.N_importance > 0 else 4
+    output_ch = 4
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
     grad_vars = list(model.parameters())
-
-    model_fine = None
-    if args.N_importance > 0:
-        model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
-                          input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
-        grad_vars += list(model_fine.parameters())
 
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
@@ -306,8 +299,6 @@ def create_nerf(args, occ_aabb: torch.Tensor):
 
         # Load model
         model.load_state_dict(ckpt['network_fn_state_dict'])
-        if model_fine is not None:
-            model_fine.load_state_dict(ckpt['network_fine_state_dict'])
 
     ##########################
 
@@ -323,8 +314,6 @@ def create_nerf(args, occ_aabb: torch.Tensor):
     render_kwargs_train = {
         'network_query_fn' : network_query_fn,
         'perturb' : args.perturb,
-        'N_importance' : args.N_importance,
-        'network_fine' : model_fine,
         'N_samples' : args.N_samples,
         'network_fn' : model,
         'use_viewdirs' : args.use_viewdirs,
@@ -362,8 +351,6 @@ def render_rays(ray_batch,
                 retraw=False,
                 lindisp=False,
                 perturb=0.,
-                N_importance=0,
-                network_fine=None,
                 white_bkgd=False,
                 raw_noise_std=0.,
                 verbose=False,
@@ -476,13 +463,6 @@ def render_rays(ray_batch,
     depth_final = depth_coarse
     extras_final = extras_coarse
 
-    if N_importance > 0 and network_fine is not None:
-        colors_fine, opacity_fine, depth_fine, extras_fine = _render_with_network(network_fine)
-        colors_final = colors_fine
-        opacity_final = opacity_fine
-        depth_final = depth_fine
-        extras_final = extras_fine
-
     depth_map = depth_final.squeeze(-1)
     acc_map = opacity_final.squeeze(-1)
     disp_map = 1. / torch.clamp(depth_map, min=1e-10)
@@ -493,14 +473,6 @@ def render_rays(ray_batch,
         'acc_map': acc_map,
         'num_samples': torch.tensor(num_samples, device=device, dtype=torch.int32),
     }
-
-    if N_importance > 0 and network_fine is not None:
-        depth_coarse_map = depth_coarse.squeeze(-1)
-        acc_coarse_map = opacity_coarse.squeeze(-1)
-        disp_coarse = 1. / torch.clamp(depth_coarse_map, min=1e-10)
-        ret['rgb0'] = colors_coarse
-        ret['disp0'] = disp_coarse
-        ret['acc0'] = acc_coarse_map
 
     weights_final = extras_final.get('weights')
     if weights_final is not None and weights_final.numel() > 0:
@@ -564,10 +536,6 @@ def config_parser():
                         help='layers in network')
     parser.add_argument("--netwidth", type=int, default=256, 
                         help='channels per layer')
-    parser.add_argument("--netdepth_fine", type=int, default=8, 
-                        help='layers in fine network')
-    parser.add_argument("--netwidth_fine", type=int, default=256, 
-                        help='channels per layer in fine network')
     parser.add_argument("--N_rand", type=int, default=32*32*4, 
                         help='batch size (number of random rays per gradient step)')
     parser.add_argument("--lrate", type=float, default=5e-4, 
@@ -587,9 +555,7 @@ def config_parser():
 
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64, 
-                        help='number of coarse samples per ray')
-    parser.add_argument("--N_importance", type=int, default=0,
-                        help='number of additional fine samples per ray')
+                        help='target number of samples per ray for nerfacc step sizing')
     parser.add_argument("--perturb", type=float, default=1.,
                         help='set to 0. for no jitter, 1. for jitter')
     parser.add_argument("--use_viewdirs", action='store_true', 
@@ -874,13 +840,7 @@ def train():
         img_loss = img2mse(rgb, target_s)
         loss = img_loss
         psnr = mse2psnr(img_loss)
-        psnr0 = None
         avg_samples = None
-
-        if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], target_s)
-            loss = loss + img_loss0
-            psnr0 = mse2psnr(img_loss0)
 
         loss.backward()
         optimizer.step()
@@ -917,9 +877,6 @@ def train():
                 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }
-            network_fine = render_kwargs_train.get('network_fine')
-            if network_fine is not None:
-                checkpoint['network_fine_state_dict'] = network_fine.state_dict()
             torch.save(checkpoint, path)
             print('Saved checkpoints at', path)
 
@@ -969,8 +926,6 @@ def train():
                 tf.contrib.summary.scalar('loss', loss)
                 tf.contrib.summary.scalar('psnr', psnr)
                 tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
 
 
             if i%args.i_img==0:
@@ -995,12 +950,6 @@ def train():
                     tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
 
 
-                if args.N_importance > 0:
-
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
         """
 
         global_step += 1
@@ -1010,8 +959,6 @@ def train():
             writer.add_scalar('train/loss', loss.item(), current_step)
             writer.add_scalar('train/psnr', psnr.item(), current_step)
             writer.add_scalar('train/lr', new_lrate, current_step)
-            if psnr0 is not None:
-                writer.add_scalar('train/psnr_coarse', psnr0.item(), current_step)
             if avg_samples is not None:
                 writer.add_scalar('train/samples_per_ray', avg_samples, current_step)
 
