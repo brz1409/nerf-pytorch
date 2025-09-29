@@ -123,6 +123,24 @@ def compute_occ_aabb(poses: np.ndarray,
     return torch.tensor(occ, device=device)
 
 
+def prepare_video_frames(frames: np.ndarray, repeat: int, hold: int) -> np.ndarray:
+    """Repeat and pad frames so output video plays at a comfortable pace."""
+    if frames.size == 0:
+        return frames
+
+    repeat = max(int(repeat), 1)
+    hold = max(int(hold), 0)
+
+    processed = np.repeat(frames, repeat, axis=0) if repeat > 1 else frames
+
+    if hold > 0:
+        start_pad = np.repeat(processed[:1], hold, axis=0)
+        end_pad = np.repeat(processed[-1:], hold, axis=0)
+        processed = np.concatenate([start_pad, processed, end_pad], axis=0)
+
+    return processed
+
+
 def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
@@ -626,7 +644,7 @@ def config_parser():
 
     # logging/saving options
     parser.add_argument("--i_print",   type=int, default=100, 
-                        help='frequency of console printout and metric loggin')
+                        help='frequency of console printout and metric logging')
     parser.add_argument("--i_img",     type=int, default=500, 
                         help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000, 
@@ -635,6 +653,12 @@ def config_parser():
                         help='frequency of testset saving')
     parser.add_argument("--i_video",   type=int, default=50000, 
                         help='frequency of render_poses video saving')
+    parser.add_argument("--video_fps", type=int, default=24,
+                        help='frames per second used when encoding render_poses videos')
+    parser.add_argument("--video_repeat", type=int, default=2,
+                        help='number of times to repeat each rendered frame before encoding')
+    parser.add_argument("--video_hold", type=int, default=12,
+                        help='extra frames to hold on the first and last views in encoded videos')
 
     return parser
 
@@ -894,8 +918,18 @@ def train():
                 rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
-            imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
-            imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
+
+            rgb_frames = prepare_video_frames(rgbs, args.video_repeat, args.video_hold)
+            disp_frames = prepare_video_frames(disps, args.video_repeat, args.video_hold)
+
+            fps = max(args.video_fps, 1)
+            imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgb_frames), fps=fps, quality=8)
+
+            disp_max = np.max(disp_frames)
+            if not np.isfinite(disp_max) or disp_max <= 0:
+                disp_max = 1.0
+            disp_normalized = disp_frames / disp_max
+            imageio.mimwrite(moviebase + 'disp.mp4', to8b(disp_normalized), fps=fps, quality=8)
 
             # if args.use_viewdirs:
             #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
