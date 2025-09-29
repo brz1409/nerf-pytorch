@@ -886,7 +886,15 @@ def train():
         optimizer.step()
 
         if num_samples_tensor is not None and num_samples_tensor.numel() > 0:
-            avg_samples = num_samples_tensor.float().mean().item()
+            samples_total = float(num_samples_tensor.item())
+
+            if isinstance(batch_rays, torch.Tensor) and batch_rays.ndim >= 2:
+                rays_in_batch = batch_rays.shape[-2]
+            else:
+                rays_in_batch = target_s.shape[0]
+
+            rays_in_batch = max(int(rays_in_batch), 1)
+            avg_samples = samples_total / float(rays_in_batch)
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
