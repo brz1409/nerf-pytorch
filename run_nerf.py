@@ -764,7 +764,8 @@ def train():
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
     
     start = start + 1
-    for i in trange(start, N_iters):
+    progress_bar = trange(start, N_iters, desc='train')
+    for i in progress_bar:
         time0 = time.time()
 
         # Sample random ray batch
@@ -854,6 +855,13 @@ def train():
         dt = time.time()-time0
         # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
+
+        postfix_samples = avg_samples if avg_samples is not None else float('nan')
+        progress_bar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            psnr=f"{psnr.item():.2f}",
+            samples=f"{postfix_samples:.1f}" if np.isfinite(postfix_samples) else 'n/a'
+        )
 
         # Rest is logging
         if i%args.i_weights==0:
