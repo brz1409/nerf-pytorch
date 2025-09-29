@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm, trange
 
+from torch.utils.tensorboard import SummaryWriter
+
 import matplotlib.pyplot as plt
 
 import nerfacc
@@ -746,6 +748,9 @@ def train():
 
             return
 
+    summary_dir = os.path.join(basedir, 'summaries', expname)
+    writer = SummaryWriter(summary_dir)
+
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
     use_batching = not args.no_batching
@@ -845,6 +850,8 @@ def train():
         img_loss = img2mse(rgb, target_s)
         loss = img_loss
         psnr = mse2psnr(img_loss)
+        psnr0 = None
+        avg_samples = None
 
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
@@ -853,6 +860,9 @@ def train():
 
         loss.backward()
         optimizer.step()
+
+        if num_samples_tensor is not None and num_samples_tensor.numel() > 0:
+            avg_samples = num_samples_tensor.float().mean().item()
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
@@ -949,6 +959,58 @@ def train():
         """
 
         global_step += 1
+        current_step = global_step
+
+        if current_step % args.i_print == 0:
+            writer.add_scalar('train/loss', loss.item(), current_step)
+            writer.add_scalar('train/psnr', psnr.item(), current_step)
+            writer.add_scalar('train/lr', new_lrate, current_step)
+            if psnr0 is not None:
+                writer.add_scalar('train/psnr_coarse', psnr0.item(), current_step)
+            if avg_samples is not None:
+                writer.add_scalar('train/samples_per_ray', avg_samples, current_step)
+
+        if args.i_img > 0 and current_step % args.i_img == 0 and i_val.size > 0:
+            img_i = np.random.choice(i_val)
+
+            if isinstance(images, torch.Tensor):
+                target_img = images[img_i]
+            else:
+                target_img = torch.from_numpy(images[img_i])
+            target_img = target_img.to(device)
+
+            pose = poses[img_i, :3, :4]
+            with torch.no_grad():
+                rgb_holdout, disp_holdout, acc_holdout, _ = render(
+                    H,
+                    W,
+                    K,
+                    chunk=args.chunk,
+                    c2w=pose,
+                    **render_kwargs_test,
+                )
+
+            psnr_holdout = mse2psnr(img2mse(rgb_holdout, target_img))
+
+            writer.add_scalar('val/psnr', psnr_holdout.item(), current_step)
+
+            rgb_to_log = torch.clamp(rgb_holdout.detach().cpu().permute(2, 0, 1), 0.0, 1.0)
+            target_to_log = torch.clamp(target_img.detach().cpu().permute(2, 0, 1), 0.0, 1.0)
+            writer.add_image('val/pred_rgb', rgb_to_log, current_step)
+            writer.add_image('val/target_rgb', target_to_log, current_step)
+
+            disp_to_log = disp_holdout.detach().cpu()
+            if torch.isfinite(disp_to_log).any():
+                disp_norm = disp_to_log
+                max_disp = disp_norm.max()
+                if torch.isfinite(max_disp) and max_disp > 0:
+                    disp_norm = disp_norm / max_disp
+                writer.add_image('val/disp', disp_norm.unsqueeze(0), current_step)
+
+            acc_to_log = acc_holdout.detach().cpu()
+            writer.add_image('val/acc', acc_to_log.unsqueeze(0), current_step)
+
+    writer.close()
 
 
 if __name__=='__main__':
