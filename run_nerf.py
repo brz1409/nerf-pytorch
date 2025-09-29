@@ -1,26 +1,15 @@
-import os, sys
-import numpy as np
-import imageio
-import json
-import random
+import os
 import time
 from typing import Any, Dict
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
+import imageio
+import nerfacc
 from torch import Tensor
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
-from torch.utils.tensorboard import SummaryWriter
-
-import matplotlib.pyplot as plt
-
-import nerfacc
-
-from run_nerf_helpers import *
-
 from load_dataset import load_dataset
-
+from run_nerf_helpers import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -348,12 +337,8 @@ def render_rays(ray_batch,
                 network_fn,
                 network_query_fn,
                 N_samples,
-                retraw=False,
-                lindisp=False,
                 perturb=0.,
-                white_bkgd=False,
                 raw_noise_std=0.,
-                verbose=False,
                 pytest=False,
                 **kwargs):
     """Volumetric rendering using nerfacc accelerated sampling."""
@@ -739,6 +724,7 @@ def train():
             return
 
     summary_dir = os.path.join(basedir, 'summaries', expname)
+    os.makedirs(summary_dir, exist_ok=True)
     writer = SummaryWriter(summary_dir)
 
     # Prepare raybatch tensor if batching random rays
