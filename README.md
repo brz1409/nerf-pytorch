@@ -104,6 +104,8 @@ replace `{DATASET}` with `trex` | `horns` | `flower` | `fortress` | `lego` | etc
 #### NerfAcc configuration
 This branch always trains a single nerfacc-accelerated NeRF. The legacy coarse/fine split and `N_importance` flag were removed; tune per-ray sampling density via `N_samples` only.
 
+- Reduce TensorBoard overhead by adjusting `--log_scalars_every` (default `500`) if you need denser or sparser scalar logging.
+
 
 ### Pre-trained Models
 

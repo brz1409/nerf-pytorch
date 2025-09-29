@@ -610,6 +610,8 @@ def config_parser():
                         help='number of times to repeat each rendered frame before encoding')
     parser.add_argument("--video_hold", type=int, default=12,
                         help='extra frames to hold on the first and last views in encoded videos')
+    parser.add_argument("--log_scalars_every", type=int, default=500,
+                        help='number of optimization steps between TensorBoard scalar writes')
 
     return parser
 
@@ -763,6 +765,8 @@ def train():
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
     
+    scalar_log_period = max(args.log_scalars_every, 1)
+
     start = start + 1
     progress_bar = trange(start, N_iters, desc='train')
     for i in progress_bar:
@@ -856,13 +860,6 @@ def train():
         # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
 
-        postfix_samples = avg_samples if avg_samples is not None else float('nan')
-        progress_bar.set_postfix(
-            loss=f"{loss.item():.4f}",
-            psnr=f"{psnr.item():.2f}",
-            samples=f"{postfix_samples:.1f}" if np.isfinite(postfix_samples) else 'n/a'
-        )
-
         # Rest is logging
         if i%args.i_weights==0:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
@@ -949,12 +946,20 @@ def train():
         global_step += 1
         current_step = global_step
 
-        if current_step % args.i_print == 0:
+        if current_step % scalar_log_period == 0:
             writer.add_scalar('train/loss', loss.item(), current_step)
             writer.add_scalar('train/psnr', psnr.item(), current_step)
             writer.add_scalar('train/lr', new_lrate, current_step)
             if avg_samples is not None:
                 writer.add_scalar('train/samples_per_ray', avg_samples, current_step)
+
+        if current_step % scalar_log_period == 0:
+            postfix_samples = avg_samples if avg_samples is not None else float('nan')
+            progress_bar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                psnr=f"{psnr.item():.2f}",
+                samples=f"{postfix_samples:.1f}" if np.isfinite(postfix_samples) else 'n/a'
+            )
 
         if args.i_img > 0 and current_step % args.i_img == 0 and i_val.size > 0:
             img_i = np.random.choice(i_val)
