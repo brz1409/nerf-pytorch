@@ -237,3 +237,22 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
 
     return samples
+
+
+class ProposalNet(nn.Module):
+    def __init__(self, input_ch: int, W: int = 64, D: int = 2):
+        super().__init__()
+        layers = []
+        in_c = input_ch
+        for i in range(D):
+            layers.append(nn.Linear(in_c, W))
+            layers.append(nn.ReLU(inplace=True))
+            in_c = W
+        self.mlp = nn.Sequential(*layers)
+        self.fc_sigma = nn.Linear(in_c, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [..., input_ch]
+        h = self.mlp(x)
+        sigma = F.softplus(self.fc_sigma(h), beta=1.0)
+        return sigma.squeeze(-1)

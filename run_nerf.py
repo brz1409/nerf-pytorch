@@ -1,14 +1,19 @@
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import imageio
 import nerfacc
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
 from load_dataset import load_dataset
+import run_nerf_helpers as helpers
 from run_nerf_helpers import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -163,6 +168,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         # use provided ray batch
         rays_o, rays_d = rays
 
+    viewdirs = None
     if use_viewdirs:
         # provide ray directions as input
         viewdirs = rays_d
@@ -271,7 +277,55 @@ def create_nerf(args, occ_aabb: torch.Tensor):
 
     ##########################
 
-    # Load checkpoints
+    # Proposal nets (für nerfacc.PropNetEstimator)
+    prop_embed_fn = None
+    prop_nets: List[nn.Module] = []
+    prop_estimator = None
+    prop_samples: List[int] = []
+    if getattr(args, 'use_propnet_estimator', False):
+        prop_embed_fn, prop_input_ch = get_embedder(args.prop_multires, 0)
+        levels = max(int(args.propnet_levels), 1)
+        if isinstance(args.propnet_samples, str):
+            parts = [p.strip() for p in args.propnet_samples.split(',') if p.strip()]
+            vals = [int(p) for p in parts]
+        else:
+            vals = [int(args.propnet_samples)]
+        if len(vals) == 1:
+            prop_samples = vals * levels
+        else:
+            assert len(vals) == levels, "propnet_samples muss Länge propnet_levels haben"
+            prop_samples = vals
+        for _ in range(levels):
+            net = helpers.ProposalNet(input_ch=prop_input_ch, W=args.prop_width, D=args.prop_depth).to(device)
+            prop_nets.append(net)
+        prop_optimizer = torch.optim.Adam(
+            params=[p for net in prop_nets for p in net.parameters()], lr=args.lrate, betas=(0.9, 0.999)
+        )
+        prop_estimator = nerfacc.PropNetEstimator(optimizer=prop_optimizer, scheduler=None).to(device)
+
+    # Helper: eigenes Scheduling für Proposal-Gradients
+    def _make_prop_requires_grad_fn(target_steps: float, warmup_steps: int):
+        t = max(int(target_steps), 1)
+        w = max(int(warmup_steps), 0)
+        def _fn(step: int) -> bool:
+            s = int(step)
+            if s < w:
+                return False
+            return (s % t) == 0
+        return _fn
+
+    # Always create OccGrid (für räumliches Skipping/Masking)
+    occ_estimator = nerfacc.OccGridEstimator(
+        roi_aabb=occ_aabb,
+        resolution=128,
+        levels=1,
+    ).to(device)
+    with torch.no_grad():
+        occ_estimator.occs.fill_(1.0)
+        occ_estimator.binaries.fill_(True)
+    occ_estimator.train()
+
+    # Load checkpoints (nachdem prop_nets existieren)
     if args.ft_path is not None and args.ft_path!='None':
         ckpts = [args.ft_path]
     else:
@@ -288,17 +342,14 @@ def create_nerf(args, occ_aabb: torch.Tensor):
 
         # Load model
         model.load_state_dict(ckpt['network_fn_state_dict'])
+        # Load proposal nets if present
+        if getattr(args, 'use_propnet_estimator', False) and 'proposal_nets_state_dict' in ckpt:
+            state_list = ckpt['proposal_nets_state_dict']
+            if isinstance(state_list, list) and len(state_list) == len(prop_nets):
+                for net, st in zip(prop_nets, state_list):
+                    net.load_state_dict(st)
 
     ##########################
-
-    occ_estimator = nerfacc.OccGridEstimator(
-        roi_aabb=occ_aabb,
-        resolution=128,
-        levels=1,
-    ).to(device)
-    with torch.no_grad():
-        occ_estimator.occs.fill_(1.0)
-        occ_estimator.binaries.fill_(True)
 
     render_kwargs_train = {
         'network_query_fn' : network_query_fn,
@@ -308,7 +359,10 @@ def create_nerf(args, occ_aabb: torch.Tensor):
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
+        # OccGrid Kontext
         'occ_estimator': occ_estimator,
+        'occ_aabb': occ_aabb,
+        'occ_resolution': 128,
         'render_step_size': None,
         'alpha_thre': 1e-2,
         'early_stop_eps': 1e-4,
@@ -317,6 +371,14 @@ def create_nerf(args, occ_aabb: torch.Tensor):
         'occ_ema_decay': 0.95,
         'occ_warmup_steps': 256,
         'update_occ_grid': True,
+        # PropNetEstimator
+        'use_propnet_estimator': getattr(args, 'use_propnet_estimator', False),
+        'prop_estimator': prop_estimator,
+        'prop_nets': prop_nets,
+        'prop_embed_fn': prop_embed_fn,
+        'prop_samples': prop_samples,
+        'prop_requires_grad_fn': _make_prop_requires_grad_fn(args.prop_grad_target, args.prop_grad_steps) if getattr(args, 'use_propnet_estimator', False) else None,
+        'prop_loss_w': args.prop_loss_w,
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -324,8 +386,6 @@ def create_nerf(args, occ_aabb: torch.Tensor):
         print('Not ndc!')
         render_kwargs_train['ndc'] = False
         render_kwargs_train['lindisp'] = args.lindisp
-
-    occ_estimator.train()
 
     render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = False
@@ -388,6 +448,137 @@ def render_rays(ray_batch,
     early_stop_eps = kwargs.get('early_stop_eps', 1e-4)
     cone_angle = kwargs.get('cone_angle', 0.0)
 
+    # Neu: PropNetEstimator + OccGrid-Maskierung
+    use_propnet = kwargs.get('use_propnet_estimator', False) and kwargs.get('prop_estimator', None) is not None and len(kwargs.get('prop_nets', [])) > 0
+    if use_propnet:
+        prop_estimator: nerfacc.PropNetEstimator = kwargs['prop_estimator']
+        prop_nets: List[nn.Module] = kwargs['prop_nets']
+        prop_embed_fn = kwargs['prop_embed_fn']
+        prop_samples: List[int] = kwargs['prop_samples']
+        prop_requires_grad_fn = kwargs.get('prop_requires_grad_fn', None)
+        if not callable(prop_requires_grad_fn):
+            prop_requires_grad_fn = None
+        sampling_type = 'lindisp' if kwargs.get('lindisp', False) else 'uniform'
+
+        def make_level_sigma_fn(net: nn.Module):
+            def level_fn(t_starts: Tensor, t_ends: Tensor) -> Tensor:
+                t_mids = (t_starts + t_ends) * 0.5  # [N_rays, S]
+                pos = rays_o[:, None, :] + rays_d_norm[:, None, :] * t_mids[..., None]
+                pos_flat = pos.reshape(-1, 3)
+                emb = prop_embed_fn(pos_flat)
+                sigmas = net(emb).reshape(t_starts.shape)
+                return sigmas
+            return level_fn
+        prop_sigma_fns = [make_level_sigma_fn(net) for net in prop_nets]
+
+        with torch.no_grad():
+            t_starts_mat, t_ends_mat = prop_estimator.sampling(
+                prop_sigma_fns=prop_sigma_fns,
+                prop_samples=prop_samples,
+                num_samples=N_samples,
+                n_rays=N_rays,
+                near_plane=near,
+                far_plane=far,
+                sampling_type=sampling_type,
+                stratified=perturb_enabled,
+                requires_grad=False,
+            )
+
+        # OccGrid-Maskierung der Proposal-Intervalle
+        with torch.no_grad():
+            t_mids = (t_starts_mat + t_ends_mat) * 0.5
+            pos = rays_o[:, None, :] + rays_d_norm[:, None, :] * t_mids[..., None]
+            aabb_min = kwargs.get('occ_aabb')[:3]
+            aabb_max = kwargs.get('occ_aabb')[3:]
+            res = int(kwargs.get('occ_resolution', 128))
+            size = (aabb_max - aabb_min).clamp(min=1e-6)
+            rel = (pos - aabb_min) / size
+            idx = (rel * res).clamp(0, res - 1 - 1e-6).long()
+            ix, iy, iz = idx.unbind(-1)
+            lin = ix + res * (iy + res * iz)
+            bins = occ_estimator.binaries[0].view(-1)
+            keep = bins[lin].reshape(-1)
+
+        S = t_starts_mat.shape[1]
+        base = torch.arange(N_rays, device=device).repeat_interleave(S)
+        ray_indices = base[keep]
+        t_starts = t_starts_mat.reshape(-1)[keep]
+        t_ends = t_ends_mat.reshape(-1)[keep]
+        num_samples = t_starts.shape[0]
+
+        render_bkgd = torch.ones(3, device=device) if white_bkgd else None
+        def rgb_sigma_fn(t_s: Tensor, t_e: Tensor, r_idx: Tensor):
+            if t_s.shape[0] == 0:
+                return torch.empty((0,3), device=device), torch.empty((0,), device=device)
+            mid = (t_s + t_e) * 0.5
+            positions = rays_o[r_idx] + rays_d_norm[r_idx] * mid[:, None]
+            dirs = viewdirs[r_idx] if viewdirs is not None else None
+            raw = network_query_fn(positions, dirs, network_fn)
+            rgb = torch.sigmoid(raw[..., :3])
+            sigma = F.relu(_add_noise(raw[..., 3]))
+            return rgb, sigma
+
+        colors, opacities, depths, extras = nerfacc.rendering(
+            t_starts,
+            t_ends,
+            ray_indices,
+            n_rays=N_rays,
+            rgb_sigma_fn=rgb_sigma_fn,
+            render_bkgd=render_bkgd,
+        )
+
+        # Proposal-Update mit Transmittance aus Main-Netz
+        if prop_requires_grad_fn is not None and kwargs.get('global_step', None) is not None:
+            step = int(kwargs['global_step'])
+            req_grad = bool(prop_requires_grad_fn(step))
+            with torch.set_grad_enabled(req_grad):
+                t_mids = (t_starts_mat + t_ends_mat) * 0.5
+                pos = rays_o[:, None, :] + rays_d_norm[:, None, :] * t_mids[..., None]
+                pos_flat = pos.reshape(-1, 3)
+                dirs = None
+                if use_viewdirs and viewdirs is not None:
+                    dirs = viewdirs[:, None, :].expand_as(pos)[..., :].reshape(-1, 3)
+                raw = network_query_fn(pos_flat, dirs, network_fn)
+                sigma_main = F.relu(raw[..., 3]).reshape(t_starts_mat.shape)
+                delta = (t_ends_mat - t_starts_mat).clamp(min=1e-6)
+                alpha = 1.0 - torch.exp(-sigma_main * delta)
+                trans = torch.cumprod(
+                    torch.cat([torch.ones((N_rays, 1), device=device), (1.0 - alpha + 1e-10)], dim=-1), dim=-1
+                )[:, :-1]
+                prop_estimator.update_every_n_steps(trans=trans, requires_grad=req_grad, loss_scaler=kwargs.get('prop_loss_w', 1.0))
+
+        # OccGrid-Update
+        if kwargs.get('update_occ_grid', False):
+            occ_update_every = kwargs.get('occ_update_every', 16)
+            occ_thre = kwargs.get('occ_thre', 1e-2)
+            occ_ema_decay = kwargs.get('occ_ema_decay', 0.95)
+            occ_warmup_steps = kwargs.get('occ_warmup_steps', 256)
+            global_step = kwargs.get('global_step', 0)
+            def occ_eval_fn(x: Tensor) -> Tensor:
+                dirs = torch.zeros_like(x) if requires_viewdirs else None
+                raw = network_query_fn(x, dirs, network_fn)
+                return F.relu(raw[..., 3:4]) * render_step_size
+            occ_estimator.update_every_n_steps(
+                step=global_step,
+                occ_eval_fn=occ_eval_fn,
+                occ_thre=occ_thre,
+                ema_decay=occ_ema_decay,
+                warmup_steps=occ_warmup_steps,
+                n=occ_update_every,
+            )
+
+        depth_map = depths.squeeze(-1)
+        acc_map = opacities.squeeze(-1)
+        disp_map = 1. / torch.clamp(depth_map, min=1e-10)
+        return {
+            'rgb_map': colors,
+            'disp_map': disp_map,
+            'acc_map': acc_map,
+            'num_samples': torch.tensor(num_samples, device=device, dtype=torch.int32),
+            'z_std': torch.zeros(N_rays, device=device),
+        }
+
+    # ...existing code continues with OccGrid-only sampling...
     def _sigma_fn_est(t_s: Tensor, t_e: Tensor, r_idx: Tensor) -> Tensor:
         if t_s.shape[0] == 0:
             return torch.empty((0,), device=device, dtype=rays_o.dtype)
@@ -613,6 +804,17 @@ def config_parser():
     parser.add_argument("--log_scalars_every", type=int, default=500,
                         help='number of optimization steps between TensorBoard scalar writes')
 
+    # PropNetEstimator-Flags ergänzen
+    parser.add_argument("--use_propnet_estimator", action='store_true', help='use nerfacc PropNetEstimator (proposal nets)')
+    parser.add_argument("--propnet_levels", type=int, default=2, help='number of proposal levels')
+    parser.add_argument("--propnet_samples", type=str, default="64,64", help='samples per level, comma-separated or single int')
+    parser.add_argument("--prop_multires", type=int, default=6, help='positional encoding multires for proposal nets')
+    parser.add_argument("--prop_width", type=int, default=64, help='hidden width for proposal nets')
+    parser.add_argument("--prop_depth", type=int, default=2, help='hidden layers for proposal nets')
+    parser.add_argument("--prop_grad_target", type=float, default=5.0, help='target steps between prop updates')
+    parser.add_argument("--prop_grad_steps", type=int, default=1000, help='warmup steps for prop updates')
+    parser.add_argument("--prop_loss_w", type=float, default=1.0, help='loss scale for prop updates')
+
     return parser
 
 
@@ -732,6 +934,11 @@ def train():
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
     use_batching = not args.no_batching
+    # Defensive initializations to avoid IDE warnings
+    i_batch = 0
+    rays_rgb = None
+    batch_rays = None
+    target_s = None
     if use_batching:
         # For random ray batching
         print('get rays')
@@ -868,6 +1075,9 @@ def train():
                 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }
+            # Proposal-NN-States sichern
+            if render_kwargs_train.get('use_propnet_estimator', False):
+                checkpoint['proposal_nets_state_dict'] = [n.state_dict() for n in render_kwargs_train.get('prop_nets', [])]
             torch.save(checkpoint, path)
             print('Saved checkpoints at', path)
 
