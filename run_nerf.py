@@ -293,8 +293,8 @@ def create_nerf(args, occ_aabb: torch.Tensor):
 
     occ_estimator = nerfacc.OccGridEstimator(
         roi_aabb=occ_aabb,
-        resolution=128,
-        levels=1,
+        resolution=256,
+        levels=2,
     ).to(device)
     with torch.no_grad():
         occ_estimator.occs.fill_(1.0)
